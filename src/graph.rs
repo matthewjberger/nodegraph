@@ -1,820 +1,413 @@
 use crate::NodeGraphError;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::{
-    any::Any,
-    collections::{HashMap, VecDeque},
-    error::Error,
-};
+use petgraph::{graph::NodeIndex, visit::EdgeRef, Direction, Graph};
+use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, fmt::Debug, hash::Hash};
 
-pub type ComponentMap<K> = HashMap<K, serde_json::Value>;
-pub type NodeMap<ID, K> = HashMap<ID, ComponentMap<K>>;
-pub type EdgeMap<ID> = AdjacencyList<ID>;
-
-#[derive(Default, Serialize, Deserialize, Debug, PartialEq, Clone)]
-pub struct NodeGraph<ID: Eq + std::hash::Hash + Clone, K: Eq + std::hash::Hash + Clone> {
-    pub nodes: NodeMap<ID, K>,
-    pub edges: Vec<EdgeMap<ID>>,
-}
-
-#[derive(Default, Serialize, Deserialize, Debug, PartialEq, Clone)]
-pub struct AdjacencyList<ID: Eq + std::hash::Hash + Clone> {
-    pub edges: HashMap<ID, Vec<ID>>,
-}
-
-impl<ID, K> NodeGraph<ID, K>
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NodeGraph<Node, Edge, NodeData>
 where
-    ID: Eq + std::hash::Hash + Clone + Serialize + for<'de> Deserialize<'de> + std::fmt::Display,
-    K: Eq + std::hash::Hash + Clone + Serialize + for<'de> Deserialize<'de> + std::fmt::Display,
+    Node: Eq + Hash + Clone + Ord + Debug,
+    Edge: Clone + PartialEq + Debug,
+    NodeData: Serialize + Clone + PartialEq + Debug,
 {
-    pub fn to_dot(&self) -> String {
-        let mut dot_str = String::from("digraph G {\n");
-        for adj_list in &self.edges {
-            for (source_id, targets) in &adj_list.edges {
-                for target_id in targets {
-                    dot_str.push_str(&format!("\t\"{source_id}\" -> \"{target_id}\";\n"));
-                }
-            }
-        }
-        dot_str.push('}');
-        dot_str
-    }
-
-    pub fn add_node(
-        &mut self,
-        id: ID,
-        components: HashMap<K, serde_json::Value>,
-    ) -> Result<(), NodeGraphError> {
-        if self.nodes.contains_key(&id) {
-            return Err(NodeGraphError::NodeAlreadyExists);
-        }
-        self.nodes.insert(id, components);
-        Ok(())
-    }
-
-    pub fn remove_node(&mut self, id: &ID) {
-        self.nodes.remove(id);
-        for relation in &mut self.edges {
-            relation.edges.remove(id);
-        }
-    }
-
-    pub fn add_edge(&mut self, from: ID, to: ID) -> Result<(), NodeGraphError> {
-        if !self.nodes.contains_key(&from) || !self.nodes.contains_key(&to) {
-            return Err(NodeGraphError::EdgeError);
-        }
-
-        let relationship_exists = self.edges.last_mut().is_some();
-        if !relationship_exists {
-            self.edges.push(AdjacencyList {
-                edges: HashMap::new(),
-            });
-        }
-
-        let relationship = self.edges.last_mut().unwrap();
-        relationship.edges.entry(from).or_default().push(to);
-        Ok(())
-    }
-
-    pub fn remove_edge(&mut self, from: ID, to: ID) -> Result<(), NodeGraphError> {
-        // Check if both entities exist
-        if !self.nodes.contains_key(&from) || !self.nodes.contains_key(&to) {
-            return Err(NodeGraphError::EdgeError);
-        }
-
-        // Check if there's a relationship to remove from
-        if let Some(relationship) = self.edges.last_mut() {
-            if let Some(neighbors) = relationship.edges.get_mut(&from) {
-                // Remove the target node from the list of neighbors
-                if let Some(index) = neighbors.iter().position(|x| x == &to) {
-                    neighbors.remove(index);
-                }
-
-                // If the node has no more neighbors, remove its entry
-                if neighbors.is_empty() {
-                    relationship.edges.remove(&from);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn serialize(&self) -> Result<String, Box<dyn Error>> {
-        serde_json::to_string(&self).map_err(Into::into)
-    }
-
-    pub fn deserialize_with_registry(
-        data: &str,
-        registry: &TypeRegistry,
-    ) -> Result<Self, NodeGraphError> {
-        let mut graph: Self = serde_json::from_str(data).map_err(|e| {
-            NodeGraphError::DeserializationError(format!("Failed to deserialize graph: {}", e))
-        })?;
-
-        // Deserialize components
-        for (_id, component_map) in graph.nodes.iter_mut() {
-            for (type_name, value) in component_map.iter_mut() {
-                match registry.deserialize_value(&type_name.to_string(), value) {
-                    Ok(new_value) => *value = new_value,
-                    Err(e) => {
-                        return Err(NodeGraphError::DeserializationError(format!(
-                            "Failed to deserialize component: {}",
-                            e
-                        )))
-                    }
-                }
-            }
-        }
-
-        Ok(graph)
-    }
-
-    pub fn traverse_dfs(&self, start: ID) -> Option<Vec<ID>> {
-        let mut visited = HashMap::new();
-        let mut stack = vec![start];
-        let mut result = Vec::new();
-
-        while let Some(current) = stack.pop() {
-            if !visited.contains_key(&current) {
-                visited.insert(current.clone(), true);
-                result.push(current.clone());
-
-                if let Some(neighbors) = self.get_neighbors(&current) {
-                    for neighbor in neighbors {
-                        if !visited.contains_key(neighbor) {
-                            stack.push(neighbor.clone());
-                        }
-                    }
-                }
-            }
-        }
-
-        if result.is_empty() {
-            None
-        } else {
-            Some(result)
-        }
-    }
-
-    pub fn traverse_bfs(&self, start: ID) -> Option<Vec<ID>> {
-        let mut visited = HashMap::new();
-        let mut queue = VecDeque::new();
-        let mut result = Vec::new();
-
-        queue.push_back(start.clone());
-        visited.insert(start.clone(), true);
-
-        while let Some(current) = queue.pop_front() {
-            result.push(current.clone());
-
-            if let Some(neighbors) = self.get_neighbors(&current) {
-                for neighbor in neighbors {
-                    if !visited.contains_key(neighbor) {
-                        visited.insert(neighbor.clone(), true);
-                        queue.push_back(neighbor.clone());
-                    }
-                }
-            }
-        }
-
-        if result.is_empty() {
-            None
-        } else {
-            Some(result)
-        }
-    }
-
-    pub fn get_neighbors(&self, node_id: &ID) -> Option<&Vec<ID>> {
-        for relationship in &self.edges {
-            if let Some(neighbors) = relationship.edges.get(node_id) {
-                return Some(neighbors);
-            }
-        }
-        None
-    }
-
-    pub fn get_component(&self, node_id: &ID, component_key: &K) -> Option<&serde_json::Value> {
-        self.nodes
-            .get(node_id)
-            .and_then(|components| components.get(component_key))
-    }
-
-    pub fn get_component_as<T: DeserializeOwned>(
-        &self,
-        node_id: &ID,
-        component_key: &K,
-    ) -> Option<T> {
-        self.get_component(node_id, component_key)
-            .and_then(|value| serde_json::from_value(value.clone()).ok())
-    }
-
-    pub fn get_parent(&self, id: &ID) -> Option<ID> {
-        for relationship in &self.edges {
-            for (source_id, targets) in &relationship.edges {
-                if targets.contains(id) {
-                    return Some(source_id.clone());
-                }
-            }
-        }
-        None
-    }
+    graph: Graph<NodeData, Edge>,
+    index_map: HashMap<Node, NodeIndex>,
 }
 
-impl<ID, K> std::fmt::Display for NodeGraph<ID, K>
+impl<Node, Edge, NodeData> Default for NodeGraph<Node, Edge, NodeData>
 where
-    ID: Eq + std::hash::Hash + Clone + Serialize + for<'de> Deserialize<'de> + std::fmt::Display,
-    K: Eq + std::hash::Hash + Clone + Serialize + for<'de> Deserialize<'de> + std::fmt::Display,
+    Node: Eq + Hash + Clone + Ord + Debug,
+    Edge: Clone + PartialEq + Debug,
+    NodeData: Serialize + Clone + PartialEq + Debug,
 {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}", self.to_dot())
+    fn default() -> Self {
+        Self {
+            graph: Graph::new(),
+            index_map: HashMap::new(),
+        }
     }
 }
 
-pub type SerializationFunction =
-    Box<dyn Fn(&serde_json::Value) -> Result<Box<dyn Any + Send>, String>>;
-
-pub type DeserializationFunction = Box<dyn Fn(&(dyn Any + Send)) -> Option<serde_json::Value>>;
-
-#[derive(Default)]
-pub struct TypeRegistry {
-    deserialize_fn_map: HashMap<String, SerializationFunction>,
-    serialize_map: HashMap<String, DeserializationFunction>,
-}
-
-impl TypeRegistry {
+impl<Node, Edge, NodeData> NodeGraph<Node, Edge, NodeData>
+where
+    Node: Eq + Hash + Clone + Ord + Debug,
+    Edge: Clone + PartialEq + Debug,
+    NodeData: Serialize + Clone + PartialEq + Debug,
+{
     pub fn new() -> Self {
         Self::default()
     }
 
-    // Register a type with its serialization function
-    pub fn register<T: 'static + Send + Serialize + DeserializeOwned>(&mut self, type_name: &str) {
-        self.serialize_map.insert(
-            type_name.to_string(),
-            Box::new(move |any: &(dyn Any + Send)| {
-                any.downcast_ref::<T>()
-                    .and_then(|typed_ref| serde_json::to_value(typed_ref).ok())
-            }),
-        );
-
-        self.deserialize_fn_map.insert(
-            type_name.to_string(),
-            Box::new(move |value: &serde_json::Value| {
-                serde_json::from_value::<T>(value.clone())
-                    .map(|value| Box::new(value) as Box<dyn Any + Send>)
-                    .map_err(|e| e.to_string())
-            }),
-        );
+    pub fn add_node(&mut self, id: Node, data: NodeData) -> Node {
+        let index = self.graph.add_node(data);
+        self.index_map.insert(id.clone(), index);
+        id
     }
 
-    pub fn deserialize_value(
-        &self,
-        type_name: &str,
-        value: &serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        // Deserialize using the appropriate function from the map
-        if let Some(deserialize_fn) = self.deserialize_fn_map.get(type_name) {
-            let deserialized_value = deserialize_fn(value);
+    pub fn remove_node(&mut self, id: Node) -> Option<NodeData> {
+        if let Some(index) = self.index_map.remove(&id) {
+            return self.graph.remove_node(index);
+        }
+        None
+    }
 
-            // Attempt to re-serialize the deserialized value
-            if let Some(serialize_fn) = self.serialize_map.get(type_name) {
-                serialize_fn(&*deserialized_value?)
-                    .ok_or_else(|| format!("Failed to re-serialize for: {}", type_name))
-            } else {
-                Err(format!(
-                    "No serialization function found for type: {}",
-                    type_name
-                ))
+    pub fn add_edge(&mut self, from: Node, to: Node, value: Edge) -> Result<(), NodeGraphError> {
+        let from_index = self
+            .index_map
+            .get(&from)
+            .ok_or(NodeGraphError::NodeNotFound)?;
+        let to_index = self
+            .index_map
+            .get(&to)
+            .ok_or(NodeGraphError::NodeNotFound)?;
+        self.graph.add_edge(*from_index, *to_index, value);
+        Ok(())
+    }
+
+    pub fn get_edges_connected_to_node(&self, id: &Node) -> Option<Vec<(Node, Edge)>> {
+        self.index_map.get(id).map(|&index| {
+            self.graph
+                .edges(index)
+                .filter_map(|edge| {
+                    let (source, target) = (edge.source(), edge.target());
+                    // Assuming a directed graph, you may want to check if 'source' or 'target' matches 'index'.
+                    let adjacent_node_id = if source == index { target } else { source };
+                    // Find the ID that corresponds to the adjacent_node_index.
+                    let adjacent_node_id = self.index_map.iter().find_map(|(id, &idx)| {
+                        if idx == adjacent_node_id {
+                            Some(id.clone())
+                        } else {
+                            None
+                        }
+                    })?;
+                    let edge_weight = edge.weight().clone();
+                    Some((adjacent_node_id, edge_weight))
+                })
+                .collect()
+        })
+    }
+
+    pub fn remove_edge(&mut self, from: Node, to: Node) -> Option<Edge> {
+        if let (Some(&from_index), Some(&to_index)) =
+            (self.index_map.get(&from), self.index_map.get(&to))
+        {
+            if let Some(edge) = self.graph.find_edge(from_index, to_index) {
+                return self.graph.remove_edge(edge);
             }
-        } else {
-            Err(format!(
-                "No deserialization function found for type: {}",
-                type_name
-            ))
+        }
+        None
+    }
+
+    pub fn contains_node(&self, id: &Node) -> bool {
+        self.index_map.contains_key(id)
+    }
+
+    pub fn contains_edge(&self, from: &Node, to: &Node) -> bool {
+        if let (Some(&from_index), Some(&to_index)) =
+            (self.index_map.get(from), self.index_map.get(to))
+        {
+            return self.graph.contains_edge(from_index, to_index);
+        }
+        false
+    }
+
+    pub fn node_data(&self, id: &Node) -> Option<&NodeData> {
+        self.index_map
+            .get(id)
+            .and_then(|index| self.graph.node_weight(*index))
+    }
+
+    pub fn to_dot(&self) -> String {
+        let mut dot_string = String::from("digraph {\n");
+
+        for (id, index) in &self.index_map {
+            if let Some(data) = self.graph.node_weight(*index) {
+                let escaped_data = format!("{:?}", data).replace('\"', "\\\"");
+                dot_string += &format!("    {:?} [label=\"{}\"];\n", id, escaped_data);
+            }
+        }
+
+        for edge in self.graph.raw_edges() {
+            let source_id = self
+                .index_map
+                .iter()
+                .find(|(_id, &idx)| idx == edge.source())
+                .map(|(id, _)| id);
+            let target_id = self
+                .index_map
+                .iter()
+                .find(|(_id, &idx)| idx == edge.target())
+                .map(|(id, _)| id);
+            if let (Some(source_id), Some(target_id)) = (source_id, target_id) {
+                let escaped_edge_weight = format!("{:?}", edge.weight).replace('\"', "\\\"");
+                dot_string += &format!(
+                    "    {:?} -> {:?} [label=\"{}\"];\n",
+                    source_id, target_id, escaped_edge_weight
+                );
+            }
+        }
+
+        dot_string += "}\n";
+        dot_string
+    }
+
+    pub fn traverse_dfs(&self, start_id: &Node) -> Option<Vec<Node>> {
+        let start_index = self.index_map.get(start_id)?;
+        let mut visited = HashMap::new();
+        let mut stack = vec![*start_index];
+        let mut result = Vec::new();
+
+        while let Some(node_index) = stack.pop() {
+            if visited.contains_key(&node_index) {
+                continue;
+            }
+
+            visited.insert(node_index, true);
+            result.push(
+                self.index_map
+                    .iter()
+                    .find(|(_id, &idx)| idx == node_index)
+                    .map(|(id, _)| id.clone())
+                    .unwrap(),
+            );
+
+            for neighbor in self
+                .graph
+                .neighbors_directed(node_index, petgraph::Direction::Outgoing)
+            {
+                if !visited.contains_key(&neighbor) {
+                    stack.push(neighbor);
+                }
+            }
+        }
+
+        Some(result)
+    }
+
+    pub fn get_edges_from(&self, id: &Node) -> Option<Vec<(Node, Edge)>> {
+        let index = self.index_map.get(id)?;
+        let edges: Vec<(Node, Edge)> = self
+            .graph
+            .edges_directed(*index, Direction::Outgoing)
+            .filter_map(|edge| {
+                let target_id = self
+                    .index_map
+                    .iter()
+                    .find(|(_id, &idx)| idx == edge.target())
+                    .map(|(id, _)| id.clone());
+                let weight = edge.weight().clone();
+                target_id.map(|tid| (tid, weight))
+            })
+            .collect();
+        Some(edges)
+    }
+
+    pub fn add_nodes(&mut self, nodes: &[(Node, NodeData)]) {
+        for (id, data) in nodes {
+            self.add_node(id.clone(), data.clone());
         }
     }
-}
 
-#[derive(Default)]
-pub struct NodeGraphBuilder<ID: Eq + std::hash::Hash + Clone, K: Eq + std::hash::Hash + Clone> {
-    graph: NodeGraph<ID, K>,
-}
-
-impl<ID, K> NodeGraphBuilder<ID, K>
-where
-    ID: Eq + std::hash::Hash + Clone + Serialize + for<'de> Deserialize<'de> + std::fmt::Display,
-    K: Eq + std::hash::Hash + Clone + Serialize + for<'de> Deserialize<'de> + std::fmt::Display,
-{
-    pub fn add_node(
-        &mut self,
-        id: ID,
-        components: HashMap<K, serde_json::Value>,
-    ) -> Result<&mut Self, NodeGraphError> {
-        self.graph.add_node(id, components)?;
-        Ok(self)
+    pub fn add_edges(&mut self, edges: &[(Node, Node, Edge)]) -> Result<(), NodeGraphError> {
+        for (from, to, value) in edges {
+            self.add_edge(from.clone(), to.clone(), value.clone())?;
+        }
+        Ok(())
     }
 
-    pub fn add_edge(&mut self, from: ID, to: ID) -> Result<&mut Self, NodeGraphError> {
-        self.graph.add_edge(from, to)?;
-        Ok(self)
+    // Utility methods
+    pub fn is_empty(&self) -> bool {
+        self.graph.node_count() == 0
     }
 
-    pub fn remove_node(&mut self, id: &ID) -> &mut Self {
-        self.graph.remove_node(id);
-        self
+    pub fn node_count(&self) -> usize {
+        self.graph.node_count()
     }
 
-    pub fn build(self) -> NodeGraph<ID, K> {
-        self.graph
+    pub fn edge_count(&self) -> usize {
+        self.graph.edge_count()
     }
-}
-
-#[macro_export]
-macro_rules! register_types {
-    ($registry:expr, $(($t:ty, $s:expr)),* ) => {
-        $(
-            $registry.register::<$t>($s);
-        )*
-    };
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Value;
 
-    #[test]
-    fn test_add_remove_node() {
-        let mut graph = NodeGraph::<String, String>::default();
-        assert!(graph
-            .add_node(
-                "node1".to_string(),
-                vec![
-                    ("component_name1".to_string(), Value::from("component1")),
-                    ("component_name2".to_string(), Value::from("component2"))
-                ]
-                .into_iter()
-                .collect()
-            )
-            .is_ok());
-        assert!(graph
-            .add_node(
-                "node1".to_string(),
-                vec![("component_name3".to_string(), Value::from("component3"))]
-                    .into_iter()
-                    .collect()
-            )
-            .is_err());
+    use std::fmt;
 
-        graph.remove_node(&"node1".to_string());
-        assert!(!graph.nodes.contains_key(&"node1".to_string()));
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub enum NodeData {
+        Text(String),
+        Number(i32),
+        Position(u8, u8),
     }
 
-    #[test]
-    fn test_add_edge() {
-        let mut graph = NodeGraph::<String, String>::default();
-        graph
-            .add_node(
-                "node1".to_string(),
-                vec![("component_name1".to_string(), Value::from("component1"))]
-                    .into_iter()
-                    .collect(),
-            )
-            .unwrap();
-        graph
-            .add_node(
-                "node2".to_string(),
-                vec![("component_name2".to_string(), Value::from("component2"))]
-                    .into_iter()
-                    .collect(),
-            )
-            .unwrap();
-
-        assert!(graph
-            .add_edge("node1".to_string(), "node2".to_string())
-            .is_ok());
-        assert!(graph
-            .add_edge("node1".to_string(), "node3".to_string())
-            .is_err());
-    }
-
-    #[test]
-    fn test_remove_edge() {
-        let mut graph = NodeGraph::<String, String>::default();
-
-        // Add entities
-        graph.add_node("node1".to_string(), HashMap::new()).unwrap();
-        graph.add_node("node2".to_string(), HashMap::new()).unwrap();
-
-        // Add an edge
-        graph
-            .add_edge("node1".to_string(), "node2".to_string())
-            .unwrap();
-
-        // Assert edge exists
-        assert!(graph.get_neighbors(&"node1".to_string()).is_some());
-
-        // Remove the edge
-        graph
-            .remove_edge("node1".to_string(), "node2".to_string())
-            .unwrap();
-
-        // Assert edge is removed
-        assert!(graph.get_neighbors(&"node1".to_string()).is_none());
-    }
-
-    // Mock ECS setup
-    mod mock_ecs {
-        use serde_json::Value;
-        use std::collections::HashMap;
-
-        #[derive(Default)]
-        pub struct World {
-            pub entities: Vec<Node>,
-        }
-
-        #[derive(Default)]
-        pub struct Node {
-            pub components: HashMap<String, Value>,
-        }
-
-        impl World {
-            pub fn new() -> Self {
-                World {
-                    entities: Vec::new(),
-                }
-            }
-
-            pub fn create_node(&mut self) -> &mut Node {
-                self.entities.push(Node::default());
-                self.entities.last_mut().unwrap()
-            }
-        }
-
-        impl Node {
-            pub fn add_component(&mut self, key: &str, component: Value) {
-                self.components.insert(key.to_string(), component);
-            }
-        }
-    }
-
-    #[test]
-    fn test_populate_mock_ecs_with_node_graph() {
-        let mut graph = NodeGraph::<String, String>::default();
-        graph
-            .add_node(
-                "node1".to_string(),
-                vec![
-                    ("position".to_string(), Value::from("x:10, y:20")),
-                    ("velocity".to_string(), Value::from("dx:5, dy:-5")),
-                ]
-                .into_iter()
-                .collect(),
-            )
-            .unwrap();
-
-        let mut world = mock_ecs::World::new();
-
-        for components in graph.nodes.values() {
-            let node = world.create_node();
-            for (component_name, component_data) in components {
-                node.add_component(component_name, component_data.clone());
-            }
-        }
-
-        assert_eq!(world.entities.len(), 1);
-        let mock_node = &world.entities[0];
-        assert_eq!(
-            mock_node.components.get("position").unwrap(),
-            &Value::from("x:10, y:20")
-        );
-        assert_eq!(
-            mock_node.components.get("velocity").unwrap(),
-            &Value::from("dx:5, dy:-5")
-        );
-    }
-
-    #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
-    pub struct Component5 {
-        field1: String,
-        field2: i32,
-    }
-
-    #[test]
-    fn test_serialization_and_deserialization() {
-        let mut graph = NodeGraph::<String, String>::default();
-        graph
-            .add_node(
-                "node1".to_string(),
-                vec![
-                    ("component_name1".to_string(), Value::from("component1")),
-                    ("component_name2".to_string(), Value::from(1234)),
-                    ("component_name3".to_string(), Value::from(true)),
-                ]
-                .into_iter()
-                .collect(),
-            )
-            .unwrap();
-        graph
-            .add_node(
-                "node2".to_string(),
-                vec![("component_name4".to_string(), Value::from(5.67))]
-                    .into_iter()
-                    .collect(),
-            )
-            .unwrap();
-        graph
-            .add_edge("node1".to_string(), "node2".to_string())
-            .unwrap();
-        // Create an instance of Component5 and serialize it as a component for an node
-        let comp5 = Component5 {
-            field1: "some_data".to_string(),
-            field2: 42,
-        };
-        graph
-            .add_node(
-                "node3".to_string(),
-                vec![(
-                    "component_name5".to_string(),
-                    serde_json::to_value(comp5).unwrap(),
-                )]
-                .into_iter()
-                .collect(),
-            )
-            .unwrap();
-
-        let serialized = graph.serialize().unwrap();
-
-        // Here we set up the type registry for deserialization
-        let mut registry = TypeRegistry::new();
-        register_types!(
-            registry,
-            (String, "component_name1"),
-            (i32, "component_name2"),
-            (bool, "component_name3"),
-            (f64, "component_name4"),
-            (Component5, "component_name5")
-        );
-
-        let deserialized =
-            NodeGraph::<String, String>::deserialize_with_registry(&serialized, &registry).unwrap();
-
-        assert_eq!(graph, deserialized);
-    }
-
-    #[test]
-    fn test_dfs_traversal() {
-        let mut graph = NodeGraph::<String, String>::default();
-
-        // Adding entities
-        graph.add_node("A".to_string(), HashMap::new()).unwrap();
-        graph.add_node("B".to_string(), HashMap::new()).unwrap();
-        graph.add_node("C".to_string(), HashMap::new()).unwrap();
-        graph.add_node("D".to_string(), HashMap::new()).unwrap();
-
-        // Adding edges
-        graph.add_edge("A".to_string(), "B".to_string()).unwrap();
-        graph.add_edge("A".to_string(), "C".to_string()).unwrap();
-        graph.add_edge("B".to_string(), "D".to_string()).unwrap();
-
-        let traversal_result = graph.traverse_dfs("A".to_string()).unwrap();
-        let expected_traversal = vec![
-            "A".to_string(),
-            "C".to_string(),
-            "B".to_string(),
-            "D".to_string(),
-        ];
-
-        assert_eq!(traversal_result, expected_traversal);
-    }
-
-    #[test]
-    fn test_bfs_traversal() {
-        let mut graph = NodeGraph::<String, String>::default();
-
-        // Adding entities
-        graph.add_node("A".to_string(), HashMap::new()).unwrap();
-        graph.add_node("B".to_string(), HashMap::new()).unwrap();
-        graph.add_node("C".to_string(), HashMap::new()).unwrap();
-        graph.add_node("D".to_string(), HashMap::new()).unwrap();
-
-        // Adding edges
-        graph.add_edge("A".to_string(), "B".to_string()).unwrap();
-        graph.add_edge("A".to_string(), "C".to_string()).unwrap();
-        graph.add_edge("B".to_string(), "D".to_string()).unwrap();
-
-        let traversal_result = graph.traverse_bfs("A".to_string()).unwrap();
-        let expected_traversal = vec![
-            "A".to_string(),
-            "B".to_string(),
-            "C".to_string(),
-            "D".to_string(),
-        ];
-
-        assert_eq!(traversal_result, expected_traversal);
-    }
-
-    #[derive(Default, Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
-    enum ComponentKey {
-        #[default]
-        Position,
-        Velocity,
-    }
-
-    impl std::fmt::Display for ComponentKey {
-        fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+    impl fmt::Display for NodeData {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             write!(f, "{:?}", self)
         }
     }
 
     #[test]
-    fn test_enum_key() {
-        let mut graph = NodeGraph::<String, ComponentKey>::default();
-        graph
-            .add_node(
-                "node1".to_string(),
-                vec![
-                    (
-                        ComponentKey::Position,
-                        serde_json::Value::from("x:10, y:20"),
-                    ),
-                    (
-                        ComponentKey::Velocity,
-                        serde_json::Value::from("dx:5, dy:-5"),
-                    ),
-                ]
-                .into_iter()
-                .collect(),
-            )
-            .unwrap();
-
-        let position = graph.get_component(&"node1".to_string(), &ComponentKey::Position);
-        assert_eq!(position, Some(&serde_json::Value::from("x:10, y:20")));
+    fn test_new_graph_is_empty() {
+        let graph: NodeGraph<i32, String, String> = NodeGraph::new();
+        assert_eq!(graph.graph.node_count(), 0);
+        assert_eq!(graph.graph.edge_count(), 0);
     }
 
     #[test]
-    fn test_dfs_print_components() {
-        // Create an node graph and add entities with components
-        let mut graph = NodeGraph::<String, String>::default();
-        graph
-            .add_node(
-                "A".to_string(),
-                vec![
-                    ("type1".to_string(), serde_json::Value::from("data1")),
-                    ("type2".to_string(), serde_json::Value::from(123)),
-                ]
-                .into_iter()
-                .collect(),
-            )
-            .unwrap();
-        graph
-            .add_node(
-                "B".to_string(),
-                vec![("type1".to_string(), serde_json::Value::from("data2"))]
-                    .into_iter()
-                    .collect(),
-            )
-            .unwrap();
-        graph.add_node("C".to_string(), HashMap::new()).unwrap();
+    fn test_add_and_remove_node() {
+        let mut graph: NodeGraph<i32, String, String> = NodeGraph::new();
+        let node_id = 1;
+        let node_data = "Node 1 data".to_string();
+        graph.add_node(node_id, node_data.clone());
 
-        // Add edges for traversal
-        graph.add_edge("A".to_string(), "B".to_string()).unwrap();
-        graph.add_edge("A".to_string(), "C".to_string()).unwrap();
+        assert!(graph.contains_node(&node_id));
+        assert_eq!(graph.node_data(&node_id), Some(&node_data));
 
-        // Set up the type registry
-        let mut registry = TypeRegistry::new();
-        registry.register::<String>("type1");
-        registry.register::<i32>("type2");
-
-        // Perform DFS traversal and print components
-        let traversal_result = graph.traverse_dfs("A".to_string()).unwrap();
-
-        // Expected traversal order and component count
-        let expected_order = vec!["A", "C", "B"];
-        let expected_components = [2, 0, 1];
-
-        // Check traversal order
-        assert_eq!(traversal_result, expected_order);
-
-        for (index, node_id) in traversal_result.iter().enumerate() {
-            if let Some(components) = graph.nodes.get(node_id) {
-                // Assert the number of components
-                assert_eq!(components.len(), expected_components[index]);
-
-                // Bonus: Check component types
-                for (type_name, value) in components {
-                    assert!(
-                        registry.deserialize_value(type_name, value).is_ok(),
-                        "Component of type {} is NOT of expected type.",
-                        type_name
-                    );
-                }
-            }
-        }
+        let removed_data = graph.remove_node(node_id).unwrap();
+        assert_eq!(removed_data, node_data);
+        assert!(!graph.contains_node(&node_id));
     }
 
     #[test]
-    fn test_builder_pattern() {
-        let mut builder = NodeGraphBuilder::<String, String>::default();
+    fn test_add_and_remove_edge() {
+        let mut graph: NodeGraph<i32, String, String> = NodeGraph::new();
+        graph.add_node(1, "Node 1".to_string());
+        graph.add_node(2, "Node 2".to_string());
+        let edge_value = "connects".to_string();
 
-        builder
-            .add_node(
-                "node1".to_string(),
-                vec![
-                    (
-                        "component_name1".to_string(),
-                        serde_json::Value::from("component1"),
-                    ),
-                    (
-                        "component_name2".to_string(),
-                        serde_json::Value::from("component2"),
-                    ),
-                ]
-                .into_iter()
-                .collect(),
+        graph.add_edge(1, 2, edge_value.clone()).unwrap();
+        assert!(graph.contains_edge(&1, &2));
+
+        let removed_edge_value = graph.remove_edge(1, 2).unwrap();
+        assert_eq!(removed_edge_value, edge_value);
+        assert!(!graph.contains_edge(&1, &2));
+    }
+
+    #[test]
+    fn test_edge_cases() {
+        let mut graph: NodeGraph<i32, String, String> = NodeGraph::new();
+        graph.add_node(1, "Node 1".to_string());
+        // Attempt to add an edge where one node does not exist
+        assert!(graph.add_edge(1, 2, "connects".to_string()).is_err());
+        // Attempt to remove a non-existent edge
+        assert!(graph.remove_edge(1, 2).is_none());
+        // Attempt to remove a non-existent node
+        assert!(graph.remove_node(2).is_none());
+    }
+
+    #[test]
+    fn test_graph_with_enum_node_data() {
+        let mut graph: NodeGraph<i32, String, NodeData> = NodeGraph::new();
+
+        graph.add_node(1, NodeData::Text("Node 1 data".to_string()));
+        graph.add_node(2, NodeData::Number(42));
+        graph.add_node(3, NodeData::Position(3, 4));
+
+        graph.add_edge(1, 2, "Edge 1-2".to_string()).unwrap();
+        graph.add_edge(2, 3, "Edge 2-3".to_string()).unwrap();
+
+        assert!(graph.contains_edge(&1, &2));
+        assert!(graph.contains_edge(&2, &3));
+
+        graph.remove_node(2);
+        assert!(!graph.contains_node(&2));
+        assert!(!graph.contains_edge(&1, &2));
+        assert!(!graph.contains_edge(&2, &3));
+    }
+
+    #[test]
+    fn test_serialization_and_deserialization() {
+        let mut graph: NodeGraph<u32, String, String> = NodeGraph::new();
+        graph.add_node(1, "Node1".to_string());
+        graph.add_node(2, "Node2".to_string());
+        graph.add_edge(1, 2, "Edge1-2".to_string()).unwrap();
+
+        let serialized = serde_json::to_string(&graph).expect("Failed to serialize graph");
+        let deserialized: NodeGraph<u32, String, String> =
+            serde_json::from_str(&serialized).expect("Failed to deserialize graph");
+
+        assert!(deserialized.contains_node(&1));
+        assert!(deserialized.contains_node(&2));
+        assert!(deserialized.contains_edge(&1, &2));
+        assert_eq!(deserialized.node_data(&1), Some(&"Node1".to_string()));
+        assert_eq!(deserialized.node_data(&2), Some(&"Node2".to_string()));
+    }
+
+    #[test]
+    fn test_graphviz_output() {
+        let mut graph: NodeGraph<u32, &'static str, NodeData> = NodeGraph::new();
+        graph.add_node(1, NodeData::Text("Hello!".to_string()));
+        graph.add_node(2, NodeData::Number(3));
+        graph.add_node(3, NodeData::Position(0, 1));
+        graph.add_edge(1, 2, "Edge 1-2").unwrap();
+        graph.add_edge(2, 3, "Edge 2-3").unwrap();
+
+        let dot_output = graph.to_dot();
+        assert!(!dot_output.is_empty());
+        println!("DOT GraphViz Representation:\n{}", dot_output);
+    }
+
+    #[test]
+    fn test_get_node_data_by_id() {
+        let mut graph: NodeGraph<String, String, NodeData> = NodeGraph::new();
+        let node_id = "node1".to_string();
+        graph.add_node(node_id.clone(), NodeData::Text("Node 1 data".to_string()));
+
+        let node_data = graph.node_data(&node_id);
+        assert_eq!(node_data, Some(&NodeData::Text("Node 1 data".to_string())));
+    }
+
+    #[test]
+    fn test_traverse_dfs() {
+        let mut graph: NodeGraph<String, String, NodeData> = NodeGraph::new();
+        graph.add_node("root".to_string(), NodeData::Text("Root".to_string()));
+        graph.add_node("child1".to_string(), NodeData::Text("Child 1".to_string()));
+        graph.add_node("child2".to_string(), NodeData::Text("Child 2".to_string()));
+        graph
+            .add_edge(
+                "root".to_string(),
+                "child1".to_string(),
+                "edge1".to_string(),
             )
-            .unwrap()
-            .add_node(
+            .unwrap();
+        graph
+            .add_edge(
+                "root".to_string(),
+                "child2".to_string(),
+                "edge2".to_string(),
+            )
+            .unwrap();
+
+        let dfs_nodes = graph.traverse_dfs(&"root".to_string());
+        assert_eq!(
+            dfs_nodes,
+            Some(vec![
+                "root".to_string(),
+                "child1".to_string(),
+                "child2".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn test_get_edges_connected_to_node() {
+        let mut graph: NodeGraph<String, String, NodeData> = NodeGraph::new();
+        graph.add_node("node1".to_string(), NodeData::Text("Node 1".to_string()));
+        graph.add_node("node2".to_string(), NodeData::Number(2));
+        graph
+            .add_edge(
+                "node1".to_string(),
                 "node2".to_string(),
-                vec![(
-                    "component_name3".to_string(),
-                    serde_json::Value::from("component3"),
-                )]
-                .into_iter()
-                .collect(),
+                "edge1-2".to_string(),
             )
-            .unwrap()
-            .add_edge("node1".to_string(), "node2".to_string())
             .unwrap();
 
-        let graph = builder.build();
-
-        assert_eq!(graph.nodes.len(), 2);
-        assert_eq!(graph.edges.len(), 1);
-    }
-
-    #[test]
-    fn test_get_component_as() -> Result<(), NodeGraphError> {
-        let mut graph = NodeGraph::<String, String>::default();
-        graph.add_node(
-            "node1".to_string(),
-            vec![
-                (
-                    "component_str".to_string(),
-                    serde_json::Value::from("value1"),
-                ),
-                ("component_int".to_string(), serde_json::Value::from(451)),
-            ]
-            .into_iter()
-            .collect(),
-        )?;
-
-        assert_eq!(
-            graph.get_component_as::<String>(&"node1".to_string(), &"component_str".to_string()),
-            Some("value1".to_string())
-        );
-        assert_eq!(
-            graph.get_component_as::<i32>(&"node1".to_string(), &"component_int".to_string()),
-            Some(451)
-        );
-
-        // Test for a type mismatch
-        assert!(graph
-            .get_component_as::<i32>(&"node1".to_string(), &"component_str".to_string())
-            .is_none());
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_get_parent() {
-        let mut graph = NodeGraph::<String, String>::default();
-
-        // Add nodes
-        graph.add_node("Root".to_string(), HashMap::new()).unwrap();
-        graph
-            .add_node("Child1".to_string(), HashMap::new())
-            .unwrap();
-        graph
-            .add_node("Child2".to_string(), HashMap::new())
+        let edges = graph
+            .get_edges_connected_to_node(&"node1".to_string())
             .unwrap();
 
-        // Add edges (representing parent-child relationships)
-        graph
-            .add_edge("Root".to_string(), "Child1".to_string())
-            .unwrap();
-        graph
-            .add_edge("Root".to_string(), "Child2".to_string())
-            .unwrap();
-
-        // Test get_parent method
-        assert_eq!(
-            graph.get_parent(&"Child1".to_string()),
-            Some("Root".to_string())
-        );
-        assert_eq!(
-            graph.get_parent(&"Child2".to_string()),
-            Some("Root".to_string())
-        );
-        assert_eq!(graph.get_parent(&"Root".to_string()), None); // Root has no parent
+        assert_eq!(edges, vec![("node2".to_string(), "edge1-2".to_string())]);
     }
 }
